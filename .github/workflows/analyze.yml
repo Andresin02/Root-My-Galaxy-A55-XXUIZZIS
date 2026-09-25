@@ -9,37 +9,56 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install pahole
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y dwarves
+          sudo apt-get install -y dwarves binutils build-essential clang llvm libelf-dev zlib1g-dev pkg-config
           pahole --version
 
       - name: Verify BTF file
         run: |
-          ls -lh analysis/
-          file analysis/vmlinux.btf || true
-          xxd analysis/vmlinux.btf | head -3
+          ls -lh analysis/vmlinux.btf
+          file analysis/vmlinux.btf
 
-      - name: Dump structs with pahole
+      - name: Wrap raw BTF into ELF
+        run: |
+          cd analysis
+          objcopy -I binary -O elf64-littleaarch64 -B aarch64 vmlinux.btf btf_wrap.o
+          objcopy --rename-section .data=.BTF,alloc,load,readonly,data,contents btf_wrap.o vmlinux_with_btf.o
+          file vmlinux_with_btf.o
+          readelf -S vmlinux_with_btf.o | grep -i btf
+          ls -lh vmlinux_with_btf.o
+
+      - name: Try pahole on wrapped ELF
         id: pahole
         continue-on-error: true
         run: |
           for s in pipe_buffer pipe_inode_info cred task_struct mm_struct file_operations selinux_state rt_mutex_waiter; do
             echo "======================== $s ========================"
-            pahole -C $s analysis/vmlinux.btf 2>&1 | head -80
+            pahole -C $s analysis/vmlinux_with_btf.o 2>&1 | head -80
             echo ""
           done > structs.txt
           cat structs.txt
 
-      - name: Fallback - strings on BTF
+      - name: Fallback - build bpftool from source
         if: steps.pahole.outcome == 'failure'
         run: |
-          echo "pahole failed, dumping strings" > structs.txt
-          strings analysis/vmlinux.btf | grep -iE "pipe_buffer|pipe_inode|task_struct|cred|file_operations" | head -40 >> structs.txt
+          echo "pahole fallback to bpftool" > structs.txt
+          cd /tmp
+          git clone --depth=1 https://github.com/libbpf/bpftool.git
+          cd bpftool/src
+          make -j4
+          cd $GITHUB_WORKSPACE
+          /tmp/bpftool/src/bpftool btf dump file analysis/vmlinux.btf format c > vmlinux_types.c
+          wc -l vmlinux_types.c
+          grep -A 30 "struct pipe_buffer {" vmlinux_types.c | head -40 >> structs.txt
+          echo "" >> structs.txt
+          grep -A 40 "struct pipe_inode_info {" vmlinux_types.c | head -50 >> structs.txt
           cat structs.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: btf-analysis
-          path: structs.txt
+          path: |
+            structs.txt
+            vmlinux_types.c
