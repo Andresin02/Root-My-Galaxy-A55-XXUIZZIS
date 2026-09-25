@@ -1,0 +1,88 @@
+name: Analyze kernel offsets
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dwarves binutils
+          pip install vmlinux-to-elf
+
+      - name: Locate vmlinux
+        run: |
+          find . -name "vmlinux*" -o -name "kallsyms*" 2>/dev/null
+          ls -lh analysis/ 2>/dev/null || true
+
+      - name: Decompress if needed
+        run: |
+          cd analysis
+          for f in *.gz; do
+            [ -f "$f" ] && gunzip -k "$f" || true
+          done
+          ls -lh
+
+      - name: Check vmlinux
+        run: |
+          file analysis/vmlinux
+          readelf -h analysis/vmlinux | head -20
+
+      - name: Check for BTF
+        run: |
+          if readelf -S analysis/vmlinux | grep -q BTF; then
+            echo "BTF_FOUND=1" >> $GITHUB_ENV
+            readelf -S analysis/vmlinux | grep BTF
+          else
+            echo "BTF_FOUND=0" >> $GITHUB_ENV
+            echo "No BTF section"
+          fi
+
+      - name: Extract pipe symbols
+        run: |
+          K=analysis/kallsyms_full.txt
+          if [ -f "$K" ]; then
+            echo "=== pipe_inode_cache ==="
+            grep -E " pipe_inode_cache$| anon_pipe_buf_ops$| pipe_write$| pipe_read$" $K || true
+            echo "=== kmalloc caches ==="
+            grep -iE " kmalloc_caches$| kmalloc_cg" $K | head -10 || true
+          fi
+
+      - name: pahole dump (if BTF)
+        if: env.BTF_FOUND == '1'
+        run: |
+          for s in pipe_buffer pipe_inode_info cred task_struct mm_struct file_operations selinux_state; do
+            echo "=========== $s ==========="
+            pahole -C $s analysis/vmlinux 2>&1 | head -100 || true
+          done > pahole_output.txt
+          cat pahole_output.txt
+
+      - name: objdump fallback (no BTF)
+        if: env.BTF_FOUND == '0'
+        run: |
+          echo "No BTF: trying string search and nm"
+          nm analysis/vmlinux 2>/dev/null | grep -iE "pipe_|kmalloc" | head -40
+        continue-on-error: true
+
+      - name: Collect results
+        run: |
+          {
+            echo "########## BTF: $BTF_FOUND ##########"
+            echo ""
+            echo "########## kallsyms pipe ##########"
+            grep -iE "pipe" analysis/kallsyms_full.txt 2>/dev/null | head -80
+            echo ""
+            echo "########## pahole output ##########"
+            cat pahole_output.txt 2>/dev/null || echo "no pahole output"
+          } > analysis_output.txt
+          cat analysis_output.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-analysis
+          path: analysis_output.txt
