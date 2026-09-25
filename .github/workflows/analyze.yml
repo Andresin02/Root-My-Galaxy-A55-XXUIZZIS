@@ -9,18 +9,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install pahole
         run: |
           sudo apt-get update
-          sudo apt-get install -y dwarves binutils bpftool
+          sudo apt-get install -y dwarves
+          pahole --version
 
-      - name: Verify BTF
+      - name: Verify BTF file
         run: |
           ls -lh analysis/
-          file analysis/vmlinux.btf
-          bpftool btf dump file analysis/vmlinux.btf format raw 2>/dev/null | head -5 || true
+          file analysis/vmlinux.btf || true
+          xxd analysis/vmlinux.btf | head -3
 
-      - name: Dump structs we need
+      - name: Dump structs with pahole
+        id: pahole
+        continue-on-error: true
         run: |
           for s in pipe_buffer pipe_inode_info cred task_struct mm_struct file_operations selinux_state rt_mutex_waiter; do
             echo "======================== $s ========================"
@@ -29,19 +32,14 @@ jobs:
           done > structs.txt
           cat structs.txt
 
-      - name: Dump C definitions
+      - name: Fallback - strings on BTF
+        if: steps.pahole.outcome == 'failure'
         run: |
-          bpftool btf dump file analysis/vmlinux.btf format c > vmlinux_types.c 2>/dev/null || true
-          wc -l vmlinux_types.c
-          grep -A 30 "struct pipe_buffer {" vmlinux_types.c | head -40
-          echo "---"
-          grep -A 40 "struct pipe_inode_info {" vmlinux_types.c | head -50
-          echo "---"
-          grep -A 50 "struct task_struct {" vmlinux_types.c | head -60
+          echo "pahole failed, dumping strings" > structs.txt
+          strings analysis/vmlinux.btf | grep -iE "pipe_buffer|pipe_inode|task_struct|cred|file_operations" | head -40 >> structs.txt
+          cat structs.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: btf-analysis
-          path: |
-            structs.txt
-            vmlinux_types.c
+          path: structs.txt
